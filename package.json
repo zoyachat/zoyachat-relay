@@ -1,0 +1,13 @@
+{
+  "name": "zoyachat-relay",
+  "version": "2.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node relay-ws.mjs"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.4.0",
+    "better-sqlite3": "^11.0.0",
+    "ws": "^8.17.0"
+  }
+}
