@@ -1,6 +1,6 @@
 #!/bin/bash
 # ZoyaChat Relay Server — One-line Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/nicejee/zoyachat-relay/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/jason-zoyachat/zoyachat-relay/main/install.sh | bash
 
 set -e
 
@@ -30,7 +30,7 @@ cd /opt/relay
 if [ -d ".git" ]; then
   sudo git pull
 else
-  sudo git clone https://github.com/nicejee/zoyachat-relay.git .
+  sudo git clone https://github.com/jason-zoyachat/zoyachat-relay.git .
 fi
 
 # 4. Install dependencies
