@@ -296,6 +296,26 @@ async function handleAuth(ws, msg) {
   ws.send(JSON.stringify({ type: 'auth_ok', peerId }))
   console.log(`[relay] Authenticated: ${peerId.slice(0, 16)}... (${clients.size} online)`)
 
+  // Card-based friend adding: notify card owner about new connection
+  if (msg.card) {
+    try {
+      // Decode card: format is "ZC:" + base64(JSON{peerId, relays, ...})
+      let raw = msg.card.startsWith('ZC:') ? msg.card.slice(3) : msg.card
+      const cardJson = Buffer.from(raw, 'base64').toString('utf8')
+      const cardData = JSON.parse(cardJson)
+      if (cardData.peerId && cardData.peerId !== peerId) {
+        pushToClient(cardData.peerId, {
+          type: 'card_friend_added',
+          friendPeerId: peerId,
+          friendRelays: msg.connectedRelays || [],
+        })
+        console.log(`[relay] Card friend: ${peerId.slice(0, 12)} via card of ${cardData.peerId.slice(0, 12)}`)
+      }
+    } catch (e) {
+      console.warn(`[relay] Card parse failed:`, e.message)
+    }
+  }
+
   // Push pending messages
   pushPendingMessages(peerId)
 }
