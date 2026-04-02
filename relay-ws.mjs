@@ -129,6 +129,9 @@ db.exec(`
 `)
 try { db.exec('ALTER TABLE messages ADD COLUMN delegated_for TEXT') } catch {}
 
+// Drop file_chunks table if it exists (offline file storage removed — only text messages are stored)
+try { db.exec('DROP TABLE IF EXISTS file_chunks') } catch {}
+
 console.log('[relay] Database ready')
 
 // ── State ───────────────────────────────────────────────────────
@@ -232,7 +235,19 @@ async function handleMessage(ws, msg) {
     case 'file_chunk': {
       const effFrom = resolveDelegatePeer(peerId)
       const { to, fileId, chunkIndex, data, totalChunks, fileName } = msg
-      pushToClient(to, { type: 'file_chunk', from: effFrom, fileId, chunkIndex, data, totalChunks, fileName })
+      if (!to || !fileId || chunkIndex === undefined || !data) {
+        sendTo(peerId, { type: 'error', error: 'MISSING_FIELDS', detail: 'file_chunk' })
+        break
+      }
+      const delivered = pushToClient(to, { type: 'file_chunk', from: effFrom, fileId, chunkIndex, data, totalChunks, fileName })
+      if (delivered) {
+        sendTo(peerId, { type: 'chunk_ok', fileId, chunkIndex, status: 'delivered' })
+      } else {
+        // Peer offline — no offline storage for files (only text messages are stored)
+        sendTo(peerId, { type: 'error', error: 'PEER_OFFLINE', fileId, chunkIndex })
+        console.log(`[relay] file_chunk: peer ${to.slice(0, 12)} offline, chunk ${chunkIndex}/${totalChunks} dropped`)
+      }
+      // Push to delegates
       const fcDels = getDelegatesOf(to)
       for (const d of fcDels) pushToClient(d, { type: 'file_chunk', from: effFrom, fileId, chunkIndex, data, totalChunks, fileName, delegatedFor: to })
       break
@@ -558,6 +573,7 @@ function pushPendingMessages(peerId) {
   for (const del of delegations) {
     pushDelegatedPending(del.origin_peer, peerId)
   }
+
 }
 
 function getPeerId(ws) {
