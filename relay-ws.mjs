@@ -290,10 +290,15 @@ async function handleAuth(ws, msg) {
     return
   }
 
-  // Close existing connection for this peer
+  // Handle duplicate peerId connections
   const existing = clients.get(peerId)
-  if (existing && existing.ws !== ws) {
-    try { existing.ws.close() } catch {}
+  if (existing && existing.ws !== ws && existing.ws.readyState === 1) {
+    // Existing connection is still alive — reject the new one
+    ws.send(JSON.stringify({ type: 'auth_fail', error: 'ALREADY_CONNECTED' }))
+    ws.close(1008, 'Already connected')
+    clearTimeout(pending.timer)
+    pendingAuth.delete(ws)
+    return
   }
 
   clearTimeout(pending.timer)
