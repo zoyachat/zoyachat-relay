@@ -1,0 +1,10 @@
+services:
+  relay:
+    build: .
+    ports:
+      - "9090:9090"
+      - "9091:9091"
+    restart: unless-stopped
+    environment:
+      - PORT_WS=9090
+      - PORT_HTTP=9091

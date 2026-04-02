@@ -23,14 +23,6 @@ const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || '100')
 const AUTH_TIMEOUT_MS = 10000
 const PING_INTERVAL_MS = 30000
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000
-// ── Storage limits (anti-abuse) ─────────────────────────────────
-const MAX_PAYLOAD_SIZE = 100 * 1024                // 100 KB per single message
-const MAX_STORED_PER_RECIPIENT = 10000             // max offline messages per recipient
-const MAX_BYTES_PER_RECIPIENT = 5 * 1024 * 1024    // 5 MB per recipient
-const MAX_RECIPIENTS = 1000                        // max distinct offline recipients
-const MAX_STORED_FROM_SENDER = 50                  // per sender → per offline recipient
-const MAX_GROUP_STORED_PER_MEMBER = 200            // group offline: keep latest 200, FIFO
-const MESSAGE_TTL_MS = 72 * 60 * 60 * 1000         // 72 hours
 
 // ── Base58 ──────────────────────────────────────────────────────
 const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
@@ -69,7 +61,7 @@ function generateChallenge() {
 
 async function verifySignature(peerId, challenge, signature) {
   try {
-    const { ed25519 } = await import('@noble/curves/ed25519')
+    const { ed25519 } = await import('@noble/curves/ed25519.js')
     const pubKey = base58Decode(peerId)
     if (pubKey.length !== 32) return false
     const messageBytes = Buffer.from(challenge, 'hex')
@@ -122,6 +114,20 @@ db.exec(`
     used_at INTEGER
   );
 `)
+
+// Delegates table (linked device message delegation)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS delegates (
+    origin_peer TEXT NOT NULL,
+    delegate_peer TEXT NOT NULL,
+    registered_at INTEGER DEFAULT (unixepoch()),
+    PRIMARY KEY (origin_peer, delegate_peer)
+  );
+  CREATE INDEX IF NOT EXISTS idx_delegates_origin ON delegates(origin_peer);
+  CREATE INDEX IF NOT EXISTS idx_delegates_delegate ON delegates(delegate_peer);
+`)
+try { db.exec('ALTER TABLE messages ADD COLUMN delegated_for TEXT') } catch {}
+
 console.log('[relay] Database ready')
 
 // ── State ───────────────────────────────────────────────────────
@@ -190,28 +196,71 @@ async function handleMessage(ws, msg) {
     return
   }
 
+  // Diagnostic: log messages with missing or non-string messageId
+  if (msg.type === 'message' || msg.type === 'group_message') {
+    if (msg.messageId === undefined || msg.messageId === null) {
+      console.warn(`[relay] WARN: ${msg.type} from ${peerId.slice(0, 12)} missing messageId, keys: ${Object.keys(msg).join(',')}`)
+    } else if (typeof msg.messageId !== 'string') {
+      console.warn(`[relay] WARN: ${msg.type} from ${peerId.slice(0, 12)} messageId type=${typeof msg.messageId} value=${msg.messageId}`)
+    }
+  }
+
   switch (msg.type) {
     case 'message': handleDirectMessage(peerId, msg); break
     case 'group_message': handleGroupMessage(peerId, msg); break
     case 'receipt': handleReceipt(peerId, msg); break
-    case 'file_chunk': pushToClient(msg.to, { type: 'file_chunk', from: peerId, ...msg }); break
-    case 'file_request': pushToClient(msg.to, { type: 'file_request', from: peerId, fileId: msg.fileId }); break
-    case 'agent_message':
+    case 'file_chunk': {
+      const effFrom = resolveDelegatePeer(peerId)
+      const { to, fileId, chunkIndex, data, totalChunks, fileName } = msg
+      pushToClient(to, { type: 'file_chunk', from: effFrom, fileId, chunkIndex, data, totalChunks, fileName })
+      const fcDels = getDelegatesOf(to)
+      for (const d of fcDels) pushToClient(d, { type: 'file_chunk', from: effFrom, fileId, chunkIndex, data, totalChunks, fileName, delegatedFor: to })
+      break
+    }
+    case 'file_request': {
+      const effFrom = resolveDelegatePeer(peerId)
+      pushToClient(msg.to, { type: 'file_request', from: effFrom, fileId: msg.fileId })
+      const frqDels = getDelegatesOf(msg.to)
+      for (const d of frqDels) pushToClient(d, { type: 'file_request', from: effFrom, fileId: msg.fileId, delegatedFor: msg.to })
+      break
+    }
+    case 'agent_message': {
+      const effFrom = resolveDelegatePeer(peerId)
       if (!msg.to) { ws.send(JSON.stringify({ type: 'error', error: 'MISSING_FIELDS' })); break }
-      if (!pushToClient(msg.to, { ...msg, from: peerId })) {
+      if (!pushToClient(msg.to, { ...msg, from: effFrom })) {
         ws.send(JSON.stringify({ type: 'error', error: 'HOST_OFFLINE', agentId: msg.agentId }))
       }
       break
+    }
     case 'agent_stream':
-      if (msg.to) pushToClient(msg.to, msg)
-      break
     case 'agent_stream_end':
-      if (msg.to) pushToClient(msg.to, msg)
-      break
     case 'error':
-      if (msg.to) pushToClient(msg.to, msg)
+      if (msg.to) pushToClient(msg.to, { ...msg, from: resolveDelegatePeer(peerId) })
       break
     case 'friend_request': handleFriendRequest(peerId, msg); break
+    case 'register_delegate': {
+      const { delegatePeerId } = msg
+      if (!delegatePeerId || delegatePeerId === peerId) { sendTo(peerId, { type: 'error', error: 'MISSING_FIELDS' }); break }
+      db.prepare('INSERT OR REPLACE INTO delegates (origin_peer, delegate_peer) VALUES (?, ?)').run(peerId, delegatePeerId)
+      sendTo(peerId, { type: 'delegate_registered', delegatePeerId })
+      pushDelegatedPending(peerId, delegatePeerId)
+      console.log(`[relay] Delegate registered: ${delegatePeerId.slice(0, 12)} for origin ${peerId.slice(0, 12)}`)
+      break
+    }
+    case 'unregister_delegate': {
+      const { delegatePeerId: delP } = msg
+      if (!delP) break
+      db.prepare('DELETE FROM delegates WHERE origin_peer = ? AND delegate_peer = ?').run(peerId, delP)
+      sendTo(peerId, { type: 'delegate_unregistered', delegatePeerId: delP })
+      console.log(`[relay] Delegate unregistered: ${delP.slice(0, 12)} from origin ${peerId.slice(0, 12)}`)
+      break
+    }
+    case 'unregister_self_delegate': {
+      db.prepare('DELETE FROM delegates WHERE delegate_peer = ?').run(peerId)
+      sendTo(peerId, { type: 'self_delegate_unregistered' })
+      console.log(`[relay] Self-unregistered delegate: ${peerId.slice(0, 12)}`)
+      break
+    }
     case 'ack': handleAck(peerId, msg); break
     default:
       ws.send(JSON.stringify({ type: 'error', error: 'UNKNOWN_TYPE' }))
@@ -252,92 +301,75 @@ async function handleAuth(ws, msg) {
 }
 
 function handleDirectMessage(fromPeer, msg) {
-  const { to, payload, messageId, timestamp } = msg
+  const { to, payload, timestamp } = msg
+  const messageId = typeof msg.messageId === 'string' ? msg.messageId : (msg.messageId != null ? String(msg.messageId) : null)
   if (!to || !payload || !messageId) { sendTo(fromPeer, { type: 'error', error: 'MISSING_FIELDS' }); return }
 
-  // Stringify payload if it's an object (encrypted { nonce, ciphertext })
+  const effectiveFrom = resolveDelegatePeer(fromPeer)
   const payloadStr = (payload && typeof payload === 'object') ? JSON.stringify(payload) : payload
+  const ts = timestamp || Date.now()
 
-  // Payload size check
-  if (typeof payloadStr === 'string' && payloadStr.length > MAX_PAYLOAD_SIZE) {
-    sendTo(fromPeer, { type: 'error', error: 'PAYLOAD_TOO_LARGE', messageId })
-    return
-  }
+  db.prepare(`INSERT OR IGNORE INTO messages (message_id, from_peer, to_peer, payload, timestamp) VALUES (?, ?, ?, ?, ?)`)
+    .run(messageId, effectiveFrom, to, payloadStr, ts)
 
-  const delivered = pushToClient(to, { type: 'message', from: fromPeer, payload, messageId, timestamp: timestamp || Date.now() })
+  const delivered = pushToClient(to, { type: 'message', from: effectiveFrom, payload, messageId, timestamp: ts })
 
   if (delivered) {
-    // Store + mark delivered immediately
-    db.prepare(`INSERT OR IGNORE INTO messages (message_id, from_peer, to_peer, payload, timestamp, delivered) VALUES (?, ?, ?, ?, ?, 1)`)
-      .run(messageId, fromPeer, to, payloadStr, timestamp || Date.now())
+    db.prepare(`UPDATE messages SET delivered = 1 WHERE message_id = ? AND to_peer = ?`).run(messageId, to)
     sendTo(fromPeer, { type: 'send_ok', messageId, status: 'delivered' })
-    console.log(`[relay] DELIVERED ${messageId.slice(0, 12)}... ${fromPeer.slice(0, 12)} → ${to.slice(0, 12)}`)
+    pushToDelegates(to, { type: 'message', from: effectiveFrom, payload, messageId, timestamp: ts }, payloadStr, messageId)
+    console.log(`[relay] DELIVERED ${messageId.slice(0, 12)}... ${effectiveFrom.slice(0, 12)} → ${to.slice(0, 12)}`)
   } else {
-    // Offline storage — check limits before storing
-    const recipientCount = db.prepare(`SELECT COUNT(DISTINCT to_peer) AS cnt FROM messages WHERE delivered = 0`).get()
-    const isNewRecipient = !db.prepare(`SELECT 1 FROM messages WHERE to_peer = ? AND delivered = 0 LIMIT 1`).get(to)
-    if (isNewRecipient && (recipientCount?.cnt || 0) >= MAX_RECIPIENTS) {
-      sendTo(fromPeer, { type: 'error', error: 'RELAY_FULL', messageId })
-      return
-    }
-    const perRecipient = db.prepare(`SELECT COUNT(*) AS cnt, SUM(LENGTH(payload)) AS bytes FROM messages WHERE to_peer = ? AND delivered = 0`).get(to)
-    if ((perRecipient?.cnt || 0) >= MAX_STORED_PER_RECIPIENT) {
-      sendTo(fromPeer, { type: 'error', error: 'RECIPIENT_QUOTA_EXCEEDED', messageId })
-      return
-    }
-    if ((perRecipient?.bytes || 0) + payloadStr.length > MAX_BYTES_PER_RECIPIENT) {
-      sendTo(fromPeer, { type: 'error', error: 'RECIPIENT_SIZE_EXCEEDED', messageId })
-      return
-    }
-    // Per-sender limit for this offline recipient
-    const fromSender = db.prepare(`SELECT COUNT(*) AS cnt FROM messages WHERE from_peer = ? AND to_peer = ? AND delivered = 0`).get(fromPeer, to)
-    if ((fromSender?.cnt || 0) >= MAX_STORED_FROM_SENDER) {
-      sendTo(fromPeer, { type: 'error', error: 'SENDER_QUOTA_EXCEEDED', messageId })
-      return
-    }
-
-    db.prepare(`INSERT OR IGNORE INTO messages (message_id, from_peer, to_peer, payload, timestamp) VALUES (?, ?, ?, ?, ?)`)
-      .run(messageId, fromPeer, to, payloadStr, timestamp || Date.now())
     sendTo(fromPeer, { type: 'send_ok', messageId, status: 'stored' })
+    pushToDelegates(to, { type: 'message', from: effectiveFrom, payload, messageId, timestamp: ts }, payloadStr, messageId)
     console.log(`[relay] STORED ${messageId.slice(0, 12)}... for ${to.slice(0, 12)}`)
   }
 }
 
 function handleGroupMessage(fromPeer, msg) {
-  const { groupId, payload, messageId } = msg
+  const { groupId, payload } = msg
+  const messageId = typeof msg.messageId === 'string' ? msg.messageId : (msg.messageId != null ? String(msg.messageId) : null)
   if (!groupId || !payload || !messageId) return
 
+  const effectiveFrom = resolveDelegatePeer(fromPeer)
   const payloadStr = (payload && typeof payload === 'object') ? JSON.stringify(payload) : payload
-
-  if (typeof payloadStr === 'string' && payloadStr.length > MAX_PAYLOAD_SIZE) {
-    sendTo(fromPeer, { type: 'error', error: 'PAYLOAD_TOO_LARGE', messageId })
-    return
-  }
+  const ts = Date.now()
 
   const members = db.prepare(`SELECT peer_id FROM group_members WHERE group_id = ?`).all(groupId).map(r => r.peer_id)
-  if (!members.includes(fromPeer)) { sendTo(fromPeer, { type: 'error', error: 'NOT_MEMBER' }); return }
+  if (!members.includes(effectiveFrom)) { sendTo(fromPeer, { type: 'error', error: 'NOT_MEMBER' }); return }
+
+  // Pre-fetch delegates for all members (avoid per-member DB queries)
+  const memberDels = new Map()
+  for (const m of members) {
+    if (m === effectiveFrom) continue
+    const dels = getDelegatesOf(m)
+    if (dels.length) memberDels.set(m, dels)
+  }
 
   let delivered = 0, stored = 0
   for (const member of members) {
-    if (member === fromPeer) continue
+    if (member === effectiveFrom) continue
     const mid = `${messageId}_${member.slice(0, 8)}`
+    db.prepare(`INSERT OR IGNORE INTO messages (message_id, from_peer, to_peer, payload, group_id, timestamp) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(mid, effectiveFrom, member, payloadStr, groupId, ts)
 
-    if (pushToClient(member, { type: 'group_message', from: fromPeer, groupId, payload, messageId, timestamp: Date.now() })) {
-      db.prepare(`INSERT OR IGNORE INTO messages (message_id, from_peer, to_peer, payload, group_id, timestamp, delivered) VALUES (?, ?, ?, ?, ?, ?, 1)`)
-        .run(mid, fromPeer, member, payloadStr, groupId, Date.now())
+    if (pushToClient(member, { type: 'group_message', from: effectiveFrom, groupId, payload, messageId, timestamp: ts })) {
+      db.prepare(`UPDATE messages SET delivered = 1 WHERE message_id = ?`).run(mid)
       delivered++
     } else {
-      // Check per-recipient total quota
-      const perRecipient = db.prepare(`SELECT SUM(LENGTH(payload)) AS bytes FROM messages WHERE to_peer = ? AND delivered = 0`).get(member)
-      if ((perRecipient?.bytes || 0) + payloadStr.length > MAX_BYTES_PER_RECIPIENT) { stored++; continue }
-      // Group FIFO: keep only latest MAX_GROUP_STORED_PER_MEMBER per group per member
-      const groupCount = db.prepare(`SELECT COUNT(*) AS cnt FROM messages WHERE to_peer = ? AND group_id = ? AND delivered = 0`).get(member, groupId)
-      if ((groupCount?.cnt || 0) >= MAX_GROUP_STORED_PER_MEMBER) {
-        db.prepare(`DELETE FROM messages WHERE id = (SELECT id FROM messages WHERE to_peer = ? AND group_id = ? AND delivered = 0 ORDER BY timestamp ASC LIMIT 1)`).run(member, groupId)
-      }
-      db.prepare(`INSERT OR IGNORE INTO messages (message_id, from_peer, to_peer, payload, group_id, timestamp) VALUES (?, ?, ?, ?, ?, ?)`)
-        .run(mid, fromPeer, member, payloadStr, groupId, Date.now())
       stored++
+    }
+
+    // Push to member's delegates
+    const dels = memberDels.get(member)
+    if (dels) {
+      for (const delPeer of dels) {
+        const delMid = `${mid}_del_${delPeer.slice(0, 8)}`
+        const delegatedMsg = { type: 'group_message', from: effectiveFrom, groupId, payload, messageId, timestamp: ts, delegatedFor: member }
+        const dOk = pushToClient(delPeer, delegatedMsg)
+        db.prepare('INSERT OR IGNORE INTO messages (message_id,from_peer,to_peer,payload,group_id,timestamp,delivered,delegated_for) VALUES (?,?,?,?,?,?,?,?)')
+          .run(delMid, effectiveFrom, delPeer, payloadStr, groupId, ts, dOk ? 1 : 0, member)
+      }
     }
   }
 
@@ -347,21 +379,38 @@ function handleGroupMessage(fromPeer, msg) {
 function handleReceipt(fromPeer, msg) {
   const { to, messageId, receiptType } = msg
   if (!to || !messageId) return
-  pushToClient(to, { type: 'receipt', from: fromPeer, messageId, receiptType: receiptType || 'delivered' })
+  const effectiveFrom = resolveDelegatePeer(fromPeer)
+  pushToClient(to, { type: 'receipt', from: effectiveFrom, messageId, receiptType: receiptType || 'delivered' })
+  // Push receipt to delegates of recipient
+  for (const d of getDelegatesOf(to)) {
+    pushToClient(d, { type: 'receipt', from: effectiveFrom, messageId, receiptType: receiptType || 'delivered', delegatedFor: to })
+  }
 }
 
 function handleFriendRequest(fromPeer, msg) {
   const { to, displayName } = msg
   if (!to) return
-  pushToClient(to, { type: 'friend_request', from: fromPeer, displayName: displayName || fromPeer.slice(0, 12) })
+  const effectiveFrom = resolveDelegatePeer(fromPeer)
+  pushToClient(to, { type: 'friend_request', from: effectiveFrom, displayName: displayName || effectiveFrom.slice(0, 12) })
+  // Push to delegates of recipient
+  for (const d of getDelegatesOf(to)) {
+    pushToClient(d, { type: 'friend_request', from: effectiveFrom, displayName: displayName || effectiveFrom.slice(0, 12), delegatedFor: to })
+  }
   sendTo(fromPeer, { type: 'send_ok', status: 'sent' })
 }
 
 function handleAck(peerId, msg) {
   const { messageIds } = msg
   if (!Array.isArray(messageIds)) return
+  const effectivePeerId = resolveDelegatePeer(peerId)
   const stmt = db.prepare(`UPDATE messages SET delivered = 1 WHERE message_id = ? AND to_peer = ?`)
-  for (const id of messageIds) stmt.run(id, peerId)
+  for (const id of messageIds) {
+    stmt.run(id, effectivePeerId)
+    // Also mark delegate copies
+    if (effectivePeerId !== peerId) {
+      stmt.run(id + '_del_' + peerId.slice(0, 8), peerId)
+    }
+  }
 }
 
 // ── Push helpers ────────────────────────────────────────────────
@@ -375,16 +424,39 @@ function pushToClient(peerId, msg) {
 function sendTo(peerId, msg) { pushToClient(peerId, msg) }
 
 function pushPendingMessages(peerId) {
-  const rows = db.prepare(`SELECT * FROM messages WHERE to_peer = ? AND delivered = 0 ORDER BY timestamp ASC LIMIT 100`).all(peerId)
-  if (rows.length === 0) return
-  console.log(`[relay] Pushing ${rows.length} pending message(s) to ${peerId.slice(0, 16)}...`)
-  for (const row of rows) {
-    const payload = row.group_id
-      ? { type: 'group_message', from: row.from_peer, groupId: row.group_id, payload: row.payload, messageId: row.message_id, timestamp: row.timestamp }
-      : { type: 'message', from: row.from_peer, payload: row.payload, messageId: row.message_id, timestamp: row.timestamp }
-    if (pushToClient(peerId, payload)) {
+  // Step 1: Push own pending messages (non-delegated)
+  const rows = db.prepare(`SELECT * FROM messages WHERE to_peer = ? AND delivered = 0 AND delegated_for IS NULL ORDER BY timestamp ASC LIMIT 100`).all(peerId)
+  if (rows.length > 0) {
+    console.log(`[relay] Pushing ${rows.length} pending message(s) to ${peerId.slice(0, 16)}...`)
+    for (const row of rows) {
+      let parsedPayload = row.payload
+      try { if (typeof parsedPayload === 'string') parsedPayload = JSON.parse(parsedPayload) } catch {}
+      const payload = row.group_id
+        ? { type: 'group_message', from: row.from_peer, groupId: row.group_id, payload: parsedPayload, messageId: row.message_id, timestamp: row.timestamp }
+        : { type: 'message', from: row.from_peer, payload: parsedPayload, messageId: row.message_id, timestamp: row.timestamp }
+      if (pushToClient(peerId, payload)) {
+        db.prepare(`UPDATE messages SET delivered = 1 WHERE message_id = ?`).run(row.message_id)
+      } else break
+    }
+  }
+
+  // Step 2: Push delegated pending (messages stored for this peer as a delegate)
+  const delRows = db.prepare(`SELECT * FROM messages WHERE to_peer = ? AND delivered = 0 AND delegated_for IS NOT NULL ORDER BY timestamp ASC LIMIT 100`).all(peerId)
+  for (const row of delRows) {
+    let p = row.payload
+    try { if (typeof p === 'string') p = JSON.parse(p) } catch {}
+    const msg = row.group_id
+      ? { type: 'group_message', from: row.from_peer, groupId: row.group_id, payload: p, messageId: row.message_id, timestamp: row.timestamp, delegatedFor: row.delegated_for }
+      : { type: 'message', from: row.from_peer, payload: p, messageId: row.message_id, timestamp: row.timestamp, delegatedFor: row.delegated_for }
+    if (pushToClient(peerId, msg)) {
       db.prepare(`UPDATE messages SET delivered = 1 WHERE message_id = ?`).run(row.message_id)
     } else break
+  }
+
+  // Step 3: As a delegate, push origin's pending messages
+  const delegations = db.prepare('SELECT origin_peer FROM delegates WHERE delegate_peer = ?').all(peerId)
+  for (const del of delegations) {
+    pushDelegatedPending(del.origin_peer, peerId)
   }
 }
 
@@ -393,6 +465,54 @@ function getPeerId(ws) {
     if (client.ws === ws) return peerId
   }
   return null
+}
+
+// ── Delegate helpers ────────────────────────────────────────────
+
+function resolveDelegatePeer(fromPeer) {
+  const row = db.prepare('SELECT origin_peer FROM delegates WHERE delegate_peer = ?').get(fromPeer)
+  return row ? row.origin_peer : fromPeer
+}
+
+function getDelegatesOf(originPeer) {
+  return db.prepare('SELECT delegate_peer FROM delegates WHERE origin_peer = ?')
+    .all(originPeer).map(r => r.delegate_peer)
+}
+
+function pushToDelegates(originPeer, pushMsg, payloadStr, messageId) {
+  const delegates = getDelegatesOf(originPeer)
+  for (const del of delegates) {
+    const delMid = `${messageId}_del_${del.slice(0, 8)}`
+    const delegatedMsg = { ...pushMsg, delegatedFor: originPeer }
+    const delivered = pushToClient(del, delegatedMsg)
+    db.prepare(
+      'INSERT OR IGNORE INTO messages (message_id,from_peer,to_peer,payload,group_id,timestamp,delivered,delegated_for) VALUES (?,?,?,?,?,?,?,?)'
+    ).run(delMid, pushMsg.from, del, payloadStr, pushMsg.groupId || null, pushMsg.timestamp || Date.now(), delivered ? 1 : 0, originPeer)
+  }
+}
+
+function pushDelegatedPending(originPeer, delegatePeer) {
+  const client = clients.get(delegatePeer)
+  if (!client || client.ws.readyState !== 1) return
+  const rows = db.prepare(
+    'SELECT * FROM messages WHERE to_peer = ? AND delivered = 0 AND delegated_for IS NULL ORDER BY timestamp ASC LIMIT 100'
+  ).all(originPeer)
+  if (!rows.length) return
+  console.log(`[relay] Pushing ${rows.length} delegated pending to ${delegatePeer.slice(0, 12)} for origin ${originPeer.slice(0, 12)}`)
+  for (const row of rows) {
+    const delMid = `${row.message_id}_del_${delegatePeer.slice(0, 8)}`
+    const exists = db.prepare('SELECT 1 FROM messages WHERE message_id = ?').get(delMid)
+    if (exists) continue
+    let p = row.payload
+    try { if (typeof p === 'string') p = JSON.parse(p) } catch {}
+    const msg = row.group_id
+      ? { type: 'group_message', from: row.from_peer, groupId: row.group_id, payload: p, messageId: row.message_id, timestamp: row.timestamp, delegatedFor: originPeer }
+      : { type: 'message', from: row.from_peer, payload: p, messageId: row.message_id, timestamp: row.timestamp, delegatedFor: originPeer }
+    const ok = pushToClient(delegatePeer, msg)
+    db.prepare(
+      'INSERT OR IGNORE INTO messages (message_id,from_peer,to_peer,payload,group_id,timestamp,delivered,delegated_for) VALUES (?,?,?,?,?,?,?,?)'
+    ).run(delMid, row.from_peer, delegatePeer, row.payload, row.group_id || null, row.timestamp, ok ? 1 : 0, originPeer)
+  }
 }
 
 // ── Ping & Cleanup ──────────────────────────────────────────────
@@ -405,9 +525,13 @@ setInterval(() => {
 }, PING_INTERVAL_MS)
 
 setInterval(() => {
-  const cutoff = Math.floor((Date.now() - MESSAGE_TTL_MS) / 1000)
+  const cutoff = Math.floor((Date.now() - 7 * 24 * 60 * 60 * 1000) / 1000)
   const result = db.prepare(`DELETE FROM messages WHERE created_at < ?`).run(cutoff)
-  if (result.changes > 0) console.log(`[relay] Cleaned ${result.changes} expired messages (72h TTL)`)
+  if (result.changes > 0) console.log(`[relay] Cleaned ${result.changes} expired messages`)
+  // Clean stale delegates (not seen for 30 days)
+  const delCutoff = Math.floor((Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000)
+  const delResult = db.prepare('DELETE FROM delegates WHERE registered_at < ?').run(delCutoff)
+  if (delResult.changes > 0) console.log(`[relay] Cleaned ${delResult.changes} stale delegates`)
 }, CLEANUP_INTERVAL_MS)
 
 // ── HTTP health check ───────────────────────────────────────────
