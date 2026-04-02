@@ -304,12 +304,18 @@ async function handleAuth(ws, msg) {
       const cardJson = Buffer.from(raw, 'base64').toString('utf8')
       const cardData = JSON.parse(cardJson)
       if (cardData.peerId && cardData.peerId !== peerId) {
-        pushToClient(cardData.peerId, {
+        const cardOwner = cardData.peerId
+        const notification = {
           type: 'card_friend_added',
           friendPeerId: peerId,
           friendRelays: msg.connectedRelays || [],
-        })
-        console.log(`[relay] Card friend: ${peerId.slice(0, 12)} via card of ${cardData.peerId.slice(0, 12)}`)
+        }
+        pushToClient(cardOwner, notification)
+        // Also notify card owner's delegates
+        for (const d of getDelegatesOf(cardOwner)) {
+          pushToClient(d, { ...notification, delegatedFor: cardOwner })
+        }
+        console.log(`[relay] Card friend: ${peerId.slice(0, 12)} via card of ${cardOwner.slice(0, 12)}`)
       }
     } catch (e) {
       console.warn(`[relay] Card parse failed:`, e.message)
