@@ -158,12 +158,19 @@ wss.on('connection', (ws) => {
 
   ws.send(JSON.stringify({ type: 'challenge', challenge }))
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     try {
       const msg = JSON.parse(raw.toString())
-      handleMessage(ws, msg)
-    } catch {
-      ws.send(JSON.stringify({ type: 'error', error: 'INVALID_JSON' }))
+      await handleMessage(ws, msg)
+    } catch (e) {
+      try {
+        if (e instanceof SyntaxError) {
+          ws.send(JSON.stringify({ type: 'error', error: 'INVALID_JSON' }))
+        } else {
+          console.error(`[relay] handleMessage error:`, e.message, e.stack?.split('\n')[1]?.trim())
+          ws.send(JSON.stringify({ type: 'error', error: 'INTERNAL_ERROR' }))
+        }
+      } catch {}
     }
   })
 
@@ -335,13 +342,19 @@ function handleDirectMessage(fromPeer, msg) {
   const payloadStr = (payload && typeof payload === 'object') ? JSON.stringify(payload) : payload
   const ts = timestamp || Date.now()
 
-  db.prepare(`INSERT OR IGNORE INTO messages (message_id, from_peer, to_peer, payload, timestamp) VALUES (?, ?, ?, ?, ?)`)
-    .run(messageId, effectiveFrom, to, payloadStr, ts)
+  try {
+    db.prepare(`INSERT OR IGNORE INTO messages (message_id, from_peer, to_peer, payload, timestamp) VALUES (?, ?, ?, ?, ?)`)
+      .run(messageId, effectiveFrom, to, payloadStr, ts)
+  } catch (e) {
+    console.error(`[relay] DB insert failed for message ${messageId}:`, e.message)
+    sendTo(fromPeer, { type: 'error', error: 'STORE_FAILED', messageId })
+    return
+  }
 
   const delivered = pushToClient(to, { type: 'message', from: effectiveFrom, payload, messageId, timestamp: ts })
 
   if (delivered) {
-    db.prepare(`UPDATE messages SET delivered = 1 WHERE message_id = ? AND to_peer = ?`).run(messageId, to)
+    try { db.prepare(`UPDATE messages SET delivered = 1 WHERE message_id = ? AND to_peer = ?`).run(messageId, to) } catch {}
     sendTo(fromPeer, { type: 'send_ok', messageId, status: 'delivered' })
     pushToDelegates(to, { type: 'message', from: effectiveFrom, payload, messageId, timestamp: ts }, payloadStr, messageId)
     console.log(`[relay] DELIVERED ${messageId.slice(0, 12)}... ${effectiveFrom.slice(0, 12)} → ${to.slice(0, 12)}`)
@@ -361,7 +374,14 @@ function handleGroupMessage(fromPeer, msg) {
   const payloadStr = (payload && typeof payload === 'object') ? JSON.stringify(payload) : payload
   const ts = Date.now()
 
-  const members = db.prepare(`SELECT peer_id FROM group_members WHERE group_id = ?`).all(groupId).map(r => r.peer_id)
+  let members
+  try {
+    members = db.prepare(`SELECT peer_id FROM group_members WHERE group_id = ?`).all(groupId).map(r => r.peer_id)
+  } catch (e) {
+    console.error(`[relay] DB query group_members failed:`, e.message)
+    sendTo(fromPeer, { type: 'error', error: 'INTERNAL_ERROR', messageId })
+    return
+  }
   if (!members.includes(effectiveFrom)) { sendTo(fromPeer, { type: 'error', error: 'NOT_MEMBER' }); return }
 
   // Pre-fetch delegates for all members (avoid per-member DB queries)
@@ -376,11 +396,16 @@ function handleGroupMessage(fromPeer, msg) {
   for (const member of members) {
     if (member === effectiveFrom) continue
     const mid = `${messageId}_${member.slice(0, 8)}`
-    db.prepare(`INSERT OR IGNORE INTO messages (message_id, from_peer, to_peer, payload, group_id, timestamp) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(mid, effectiveFrom, member, payloadStr, groupId, ts)
+    try {
+      db.prepare(`INSERT OR IGNORE INTO messages (message_id, from_peer, to_peer, payload, group_id, timestamp) VALUES (?, ?, ?, ?, ?, ?)`)
+        .run(mid, effectiveFrom, member, payloadStr, groupId, ts)
+    } catch (e) {
+      console.error(`[relay] DB insert failed for group message ${mid}:`, e.message)
+      continue
+    }
 
     if (pushToClient(member, { type: 'group_message', from: effectiveFrom, groupId, payload, messageId, timestamp: ts })) {
-      db.prepare(`UPDATE messages SET delivered = 1 WHERE message_id = ?`).run(mid)
+      try { db.prepare(`UPDATE messages SET delivered = 1 WHERE message_id = ?`).run(mid) } catch {}
       delivered++
     } else {
       stored++
@@ -393,8 +418,12 @@ function handleGroupMessage(fromPeer, msg) {
         const delMid = `${mid}_del_${delPeer.slice(0, 8)}`
         const delegatedMsg = { type: 'group_message', from: effectiveFrom, groupId, payload, messageId, timestamp: ts, delegatedFor: member }
         const dOk = pushToClient(delPeer, delegatedMsg)
-        db.prepare('INSERT OR IGNORE INTO messages (message_id,from_peer,to_peer,payload,group_id,timestamp,delivered,delegated_for) VALUES (?,?,?,?,?,?,?,?)')
-          .run(delMid, effectiveFrom, delPeer, payloadStr, groupId, ts, dOk ? 1 : 0, member)
+        try {
+          db.prepare('INSERT OR IGNORE INTO messages (message_id,from_peer,to_peer,payload,group_id,timestamp,delivered,delegated_for) VALUES (?,?,?,?,?,?,?,?)')
+            .run(delMid, effectiveFrom, delPeer, payloadStr, groupId, ts, dOk ? 1 : 0, member)
+        } catch (e) {
+          console.error(`[relay] DB insert failed for delegated group message ${delMid}:`, e.message)
+        }
       }
     }
   }
