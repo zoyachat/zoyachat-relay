@@ -23,6 +23,7 @@ const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || '100')
 const AUTH_TIMEOUT_MS = 10000
 const PING_INTERVAL_MS = 30000
 const CLEANUP_INTERVAL_MS = 60 * 60 * 1000
+const MAX_CONNS_PER_PEER = 5
 
 // ── Base58 ──────────────────────────────────────────────────────
 const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
@@ -175,10 +176,22 @@ wss.on('connection', (ws) => {
   })
 
   ws.on('close', () => {
-    for (const [peerId, client] of clients) {
-      if (client.ws === ws) {
-        clients.delete(peerId)
-        console.log(`[relay] Disconnected: ${peerId.slice(0, 16)}... (${clients.size} online)`)
+    for (const [peerId, entry] of clients) {
+      if (entry.active?.ws === ws) {
+        // Active connection closed — promote first backup
+        if (entry.backups.length > 0) {
+          entry.active = entry.backups.shift()
+          console.log(`[relay] Active promoted for ${peerId.slice(0, 16)}... from=${entry.active.clientIp} (${entry.backups.length} backups)`)
+        } else {
+          clients.delete(peerId)
+          console.log(`[relay] Disconnected: ${peerId.slice(0, 16)}... (${clients.size} peers)`)
+        }
+        break
+      }
+      const idx = entry.backups.findIndex(b => b.ws === ws)
+      if (idx >= 0) {
+        entry.backups.splice(idx, 1)
+        console.log(`[relay] Backup removed for ${peerId.slice(0, 16)}... (${entry.backups.length} backups left)`)
         break
       }
     }
@@ -290,20 +303,26 @@ async function handleAuth(ws, msg) {
     return
   }
 
-  // Handle duplicate peerId connections
-  const existing = clients.get(peerId)
-  if (existing && existing.ws !== ws && existing.ws.readyState === 1) {
-    // Existing connection is still alive — reject the new one
-    ws.send(JSON.stringify({ type: 'auth_fail', error: 'ALREADY_CONNECTED' }))
-    ws.close(1008, 'Already connected')
-    clearTimeout(pending.timer)
-    pendingAuth.delete(ws)
-    return
-  }
+  const clientIp = (ws._socket?.remoteAddress || '').replace('::ffff:', '')
+  const connInfo = { ws, clientIp, authedAt: Date.now() }
 
   clearTimeout(pending.timer)
   pendingAuth.delete(ws)
-  clients.set(peerId, { ws, authedAt: Date.now() })
+
+  // Multi-connection: same peerId can have active + backups
+  const existing = clients.get(peerId)
+  if (!existing) {
+    clients.set(peerId, { active: connInfo, backups: [] })
+  } else {
+    // Evict oldest backup if at capacity
+    const totalConns = 1 + existing.backups.length
+    if (totalConns >= MAX_CONNS_PER_PEER) {
+      const evicted = existing.backups.shift()
+      try { evicted.ws.close() } catch {}
+    }
+    existing.backups.push(connInfo)
+    console.log(`[relay] Backup added for ${peerId.slice(0, 16)}... from=${clientIp} (${existing.backups.length} backups)`)
+  }
 
   ws.send(JSON.stringify({ type: 'auth_ok', peerId }))
   console.log(`[relay] Authenticated: ${peerId.slice(0, 16)}... (${clients.size} online)`)
@@ -476,9 +495,30 @@ function handleAck(peerId, msg) {
 // ── Push helpers ────────────────────────────────────────────────
 
 function pushToClient(peerId, msg) {
-  const client = clients.get(peerId)
-  if (!client || client.ws.readyState !== 1) return false
-  try { client.ws.send(JSON.stringify(msg)); return true } catch { return false }
+  const entry = clients.get(peerId)
+  if (!entry) return false
+  const data = JSON.stringify(msg)
+
+  // Try active connection first
+  if (entry.active?.ws?.readyState === 1) {
+    try { entry.active.ws.send(data); return true } catch {}
+  }
+
+  // Active failed — try backups, promote on success
+  for (let i = 0; i < entry.backups.length; i++) {
+    const b = entry.backups[i]
+    if (b.ws.readyState === 1) {
+      try {
+        b.ws.send(data)
+        entry.backups.splice(i, 1)
+        const oldActive = entry.active
+        entry.active = b
+        if (oldActive) entry.backups.push(oldActive)
+        return true
+      } catch { continue }
+    }
+  }
+  return false
 }
 
 function sendTo(peerId, msg) { pushToClient(peerId, msg) }
@@ -521,8 +561,9 @@ function pushPendingMessages(peerId) {
 }
 
 function getPeerId(ws) {
-  for (const [peerId, client] of clients) {
-    if (client.ws === ws) return peerId
+  for (const [peerId, entry] of clients) {
+    if (entry.active?.ws === ws) return peerId
+    if (entry.backups.some(b => b.ws === ws)) return peerId
   }
   return null
 }
@@ -552,8 +593,10 @@ function pushToDelegates(originPeer, pushMsg, payloadStr, messageId) {
 }
 
 function pushDelegatedPending(originPeer, delegatePeer) {
-  const client = clients.get(delegatePeer)
-  if (!client || client.ws.readyState !== 1) return
+  const entry = clients.get(delegatePeer)
+  if (!entry) return
+  const hasLive = (entry.active?.ws?.readyState === 1) || entry.backups.some(b => b.ws.readyState === 1)
+  if (!hasLive) return
   const rows = db.prepare(
     'SELECT * FROM messages WHERE to_peer = ? AND delivered = 0 AND delegated_for IS NULL ORDER BY timestamp ASC LIMIT 100'
   ).all(originPeer)
@@ -578,9 +621,26 @@ function pushDelegatedPending(originPeer, delegatePeer) {
 // ── Ping & Cleanup ──────────────────────────────────────────────
 
 setInterval(() => {
-  for (const [peerId, client] of clients) {
-    if (client.ws.readyState !== 1) { clients.delete(peerId); continue }
-    client.ws.ping()
+  for (const [peerId, entry] of clients) {
+    // Ping active
+    if (entry.active?.ws?.readyState === 1) {
+      entry.active.ws.ping()
+    } else if (entry.backups.length > 0) {
+      // Active is dead — promote
+      entry.active = entry.backups.shift()
+      entry.active.ws.ping()
+    } else {
+      clients.delete(peerId)
+      continue
+    }
+    // Ping backups, remove dead ones
+    for (let i = entry.backups.length - 1; i >= 0; i--) {
+      if (entry.backups[i].ws.readyState === 1) {
+        entry.backups[i].ws.ping()
+      } else {
+        entry.backups.splice(i, 1)
+      }
+    }
   }
 }, PING_INTERVAL_MS)
 
