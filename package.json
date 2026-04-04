@@ -1,13 +1,19 @@
 {
-  "name": "zoyachat-relay",
-  "version": "2.1.0",
-  "type": "module",
+  "name": "zoyachat-server",
+  "version": "0.1.0",
+  "description": "ZoyaChat centralized server — WebSocket messaging + HTTP file upload",
+  "main": "index.js",
   "scripts": {
-    "start": "node relay-ws.mjs"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@noble/curves": "^1.4.0",
-    "better-sqlite3": "^11.0.0",
-    "ws": "^8.17.0"
+    "better-sqlite3": "^12.8.0",
+    "bcryptjs": "^2.4.3",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.2",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.0"
   }
 }

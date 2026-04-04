@@ -1,10 +1,18 @@
+version: '3.8'
+
 services:
-  relay:
+  zoyachat-server:
     build: .
     ports:
-      - "9090:9090"
-      - "9091:9091"
-    restart: unless-stopped
+      - "9100:9100"
+    volumes:
+      - server-data:/app/data
     environment:
-      - PORT_WS=9090
-      - PORT_HTTP=9091
+      - PORT=9100
+      - JWT_SECRET=${JWT_SECRET:-zoyachat-production-secret}
+      - MAX_CONNECTIONS=500
+      - MAX_FILE_SIZE=52428800
+    restart: unless-stopped
+
+volumes:
+  server-data:
